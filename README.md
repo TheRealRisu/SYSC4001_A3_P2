@@ -7,7 +7,7 @@
 
 4. In a linux terminal, navigate to this directory and run
 
-g++ -std=c++11 -Wall -pthread TAProcess.cpp -o ta_marking -lrt
+g++ -std=c++11 -Wall -pthread TAProcess_101296691_101304731.cpp -o ta_marking -lrt
 
 A file named "ta_marking" should appear
 
