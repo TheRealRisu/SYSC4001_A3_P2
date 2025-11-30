@@ -10,6 +10,7 @@
 g++ -std=c++11 -Wall -pthread TAProcess.cpp -o ta_marking -lrt
 
 A file named "ta_marking" should appear
+
 5. In the same directory, run (Replace the "#" with a number, the number must be bigger or equal to 2_
 
 ./ta_marking #
