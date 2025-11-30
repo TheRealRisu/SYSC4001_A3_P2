@@ -12,11 +12,15 @@
 #include <dirent.h>
 #include <vector>
 #include <algorithm>
+#include <semaphore.h>
 #include "SharedMemory.hpp"
 
 using namespace std;
 
 const char* SHM_NAME = "/ta_marking_shm";
+
+// timeout
+const int DEADLOCK_TIMEOUT = 2;
 
 void initializeSharedMemory(SharedData* shared);
 bool discoverExamFiles(SharedData* shared);
@@ -80,7 +84,19 @@ int main(int argc, char* argv[]) {
 
     shared->active_tas = num_tas;
 
-    for (int i=0; i < num_tas; i++) {
+    //init
+    sem_init(&shared->rubric_mutex, 1, 1);
+    sem_init(&shared->rubric_read_count_mutex, 1, 1);
+    shared->rubric_read_count = 0;
+    
+    for (int i = 0; i < MAX_QUESTIONS; i++) {
+        sem_init(&shared->question_mutex[i], 1, 1);
+    }
+    sem_init(&shared->exam_loading_mutex, 1, 1);
+
+    cout << "Semaphores initialized for synchronization" << endl << endl;
+
+    for (int i = 0; i < num_tas; i++) {
         pid_t pid = fork();
         
         if (pid < 0) {
@@ -88,16 +104,23 @@ int main(int argc, char* argv[]) {
             return 1;
         } else if (pid == 0) {
             srand(time(NULL) + getpid());
-            taProcess(i+1, shared);
+            taProcess(i + 1, shared);
             exit(0);
         }
     }
 
-    for (int i=0; i < num_tas; i++) {
+    for (int i = 0; i < num_tas; i++) {
         wait(NULL);
     }
 
     cout << "\nAll TAs have finished marking" << endl;
+
+    sem_destroy(&shared->rubric_mutex);
+    sem_destroy(&shared->rubric_read_count_mutex);
+    for (int i = 0; i < MAX_QUESTIONS; i++) {
+        sem_destroy(&shared->question_mutex[i]);
+    }
+    sem_destroy(&shared->exam_loading_mutex);
 
     munmap(shared, sizeof(SharedData));
     close(shm_fd);
@@ -177,13 +200,12 @@ bool loadRubricToSharedMemory(SharedData* shared) {
     }
 
     file.close();
-    cout << "rubric loaded into shared memory" << endl;
+    cout << "Rubric loaded into shared memory" << endl;
     return true;
 }
 
 bool loadExamToSharedMemory(SharedData* shared, int exam_index) {
     if (exam_index >= shared->num_exam_files) {
-        cout << "No more exams to load" << endl;
         return false;
     }
 
@@ -208,6 +230,7 @@ bool loadExamToSharedMemory(SharedData* shared, int exam_index) {
 
     for (int i = 0; i < MAX_QUESTIONS; i++) {
         shared->current_exam.question_marked[i] = false;
+        shared->current_exam.question_being_marked[i] = false;
     }
     shared->current_exam_index = exam_index;
 
@@ -224,13 +247,26 @@ bool loadExamToSharedMemory(SharedData* shared, int exam_index) {
 
 void taProcess(int ta_id, SharedData* shared) {
     cout << "TA " << ta_id << " started" << endl;
+    
+    time_t last_progress = time(NULL);
 
     while (!shared->should_terminate) {
+        time_t current_time = time(NULL);
+        if (difftime(current_time, last_progress) > DEADLOCK_TIMEOUT) {
+            cout << "*** POTENTIAL DEADLOCK DETECTED by TA " << ta_id 
+                << " (no progress for " << DEADLOCK_TIMEOUT << " seconds) ***" << endl;
+            break;
+        }
+
         checkAndCorrectRubric(ta_id, shared);
 
         bool exam_complete = false;
         while (!exam_complete && !shared->should_terminate) {
             bool marked = markQuestion(ta_id, shared);
+            
+            if (marked) {
+                last_progress = time(NULL);
+            }
             
             if (!marked) {
                 bool all_marked = true;
@@ -243,11 +279,20 @@ void taProcess(int ta_id, SharedData* shared) {
 
                 if (all_marked) {
                     exam_complete = true;
+
+                    sem_wait(&shared->exam_loading_mutex);
                     
-                    int next_exam = shared->current_exam_index + 1;
-                    if (!loadExamToSharedMemory(shared, next_exam)) {
+                    if (shared->current_exam_index < shared->num_exam_files - 1) {
+                        int next_exam = shared->current_exam_index + 1;
+                        if (!loadExamToSharedMemory(shared, next_exam)) {
+                            shared->should_terminate = true;
+                        }
+                        last_progress = time(NULL);
+                    } else {
                         shared->should_terminate = true;
                     }
+                    
+                    sem_post(&shared->exam_loading_mutex);
                     break;
                 } else {
                     usleep(100000);
@@ -260,57 +305,101 @@ void taProcess(int ta_id, SharedData* shared) {
 }
 
 void checkAndCorrectRubric(int ta_id, SharedData* shared) {
+
+    sem_wait(&shared->rubric_read_count_mutex);
+    shared->rubric_read_count++;
+    if (shared->rubric_read_count == 1) {
+
+        sem_wait(&shared->rubric_mutex);
+    }
+    sem_post(&shared->rubric_read_count_mutex);
+
     cout << "TA " << ta_id << " accessing rubric" << endl;
 
     for (int i = 0; i < MAX_RUBRIC_LINES; i++) {
-
-        //correction delay
+        //random delay
         usleep(randomDelay(500000, 1000000));
 
-        //30% chance for correction
+        //30% chance of correction
         bool needs_correction = (rand() % 100) < 30;
 
         if (needs_correction) {
+
+            sem_wait(&shared->rubric_read_count_mutex);
+            shared->rubric_read_count--;
+            if (shared->rubric_read_count == 0) {
+                sem_post(&shared->rubric_mutex);
+            }
+            sem_post(&shared->rubric_read_count_mutex);
+
+            sem_wait(&shared->rubric_mutex);
+            
             char old_text = shared->rubric[i].rubric_text;
             shared->rubric[i].rubric_text = old_text + 1;
-
 
             size_t comma_pos = string(shared->rubric[i].full_line).find(',');
             if (comma_pos != string::npos) {
                 size_t text_pos = string(shared->rubric[i].full_line)
-                                    .find_first_not_of(" \t", comma_pos + 1);
+                    .find_first_not_of(" \t", comma_pos + 1);
                 if (text_pos != string::npos) {
                     shared->rubric[i].full_line[text_pos] = shared->rubric[i].rubric_text;
                 }
             }
 
             cout << "TA " << ta_id << " correcting rubric exercise " 
-                 << shared->rubric[i].exercise_num 
-                 << " ('" << old_text << "' -> '" 
-                 << shared->rubric[i].rubric_text << "')" << endl;
+                << shared->rubric[i].exercise_num 
+                << " ('" << old_text << "' -> '" 
+                << shared->rubric[i].rubric_text << "')" << endl;
 
             saveRubricToFile(shared);
+            
+            sem_post(&shared->rubric_mutex);
+
+            sem_wait(&shared->rubric_read_count_mutex);
+            shared->rubric_read_count++;
+            if (shared->rubric_read_count == 1) {
+                sem_wait(&shared->rubric_mutex);
+            }
+            sem_post(&shared->rubric_read_count_mutex);
         }
     }
+
+    sem_wait(&shared->rubric_read_count_mutex);
+    shared->rubric_read_count--;
+    if (shared->rubric_read_count == 0) {
+        sem_post(&shared->rubric_mutex);
+    }
+    sem_post(&shared->rubric_read_count_mutex);
 }
 
 bool markQuestion(int ta_id, SharedData* shared) {
-    for (int i = 0; i < MAX_QUESTIONS; i++) {
-        // change in part b
-        if (!shared->current_exam.question_marked[i]) {
-            
-            cout << "TA " << ta_id << " marking question " << (i + 1) 
-                 << " of exam " << shared->current_exam.student_number << endl;
+    for (int i=0; i < MAX_QUESTIONS; i++) {
+        if (sem_trywait(&shared->question_mutex[i]) == 0) {
 
-            //simulate
-            usleep(randomDelay(1000000, 2000000));
+            if (!shared->current_exam.question_marked[i] && 
+                !shared->current_exam.question_being_marked[i]) {
+                
+                shared->current_exam.question_being_marked[i] = true;
+                
+                cout << "TA " << ta_id << " marking question " << (i + 1) 
+                    << " of exam " << shared->current_exam.student_number << endl;
 
-            shared->current_exam.question_marked[i] = true;
+                sem_post(&shared->question_mutex[i]);
+                
+                usleep(randomDelay(1000000, 2000000));
 
-            cout << "TA " << ta_id << " finished marking question " << (i + 1)
-                 << " of exam " << shared->current_exam.student_number << endl;
+                sem_wait(&shared->question_mutex[i]);
+                shared->current_exam.question_marked[i] = true;
+                shared->current_exam.question_being_marked[i] = false;
+                sem_post(&shared->question_mutex[i]);
 
-            return true;
+                cout << "TA " << ta_id << " finished marking question " << (i + 1)
+                    << " of exam " << shared->current_exam.student_number << endl;
+
+                return true;
+            } else {
+                sem_post(&shared->question_mutex[i]);
+            }
         }
     }
 
